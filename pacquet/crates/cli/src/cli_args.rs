@@ -4,6 +4,7 @@ pub mod create;
 pub mod dlx;
 pub mod exec;
 pub mod install;
+pub mod logout;
 pub mod outdated;
 pub mod recursive;
 pub mod remove;
@@ -24,6 +25,7 @@ use create::CreateArgs;
 use dlx::DlxArgs;
 use exec::ExecArgs;
 use install::InstallArgs;
+use logout::LogoutArgs;
 use miette::{Context, IntoDiagnostic};
 use outdated::{OutdatedArgs, OutdatedOutcome};
 use pacquet_config::{Config, Host};
@@ -163,6 +165,8 @@ pub enum CliCommand {
     Store(StoreCommand),
     /// Prints the contents of a file based on the hash value stored in the index file.
     CatFile(CatFileArgs),
+    /// Log out of an npm registry.
+    Logout(LogoutArgs),
 }
 
 impl CliArgs {
@@ -462,6 +466,21 @@ impl CliArgs {
             CliCommand::Store(command) => command.run(|| config().map(|m| &*m))?,
             CliCommand::CatFile(args) => {
                 args.run(|| config().map(|m| &*m))?;
+            }
+            CliCommand::Logout(args) => {
+                let config = config()?;
+                let prefix = dir.to_string_lossy();
+                match reporter {
+                    ReporterType::Default | ReporterType::AppendOnly => {
+                        Box::pin(args.run::<DefaultReporter>(config, prefix.as_ref())).await?;
+                    }
+                    ReporterType::Ndjson => {
+                        Box::pin(args.run::<NdjsonReporter>(config, prefix.as_ref())).await?;
+                    }
+                    ReporterType::Silent => {
+                        Box::pin(args.run::<SilentReporter>(config, prefix.as_ref())).await?;
+                    }
+                }
             }
         }
 

@@ -1452,6 +1452,22 @@ pub struct Config {
     /// when no `.npmrc` was found or no auth keys were set.
     pub auth_headers: std::sync::Arc<pacquet_network::AuthHeaders>,
 
+    /// Raw `_authToken` values keyed by the nerf-darted registry URI
+    /// (`//host[:port]/path/`), for the default (registry-wide) scope.
+    /// Unlike [`Self::auth_headers`], which bakes credentials into
+    /// ready-to-send `Authorization` header values and discards the
+    /// raw token, this preserves the unmodified token so commands like
+    /// `pnpm logout` can read it back to revoke it on the registry.
+    /// Mirrors the subset of pnpm's `rawConfig` (`config.authConfig`)
+    /// that the auth commands consult.
+    pub auth_tokens_by_uri: std::collections::HashMap<String, String>,
+
+    /// The directory pnpm reads its global `config.yaml` from and where
+    /// `pnpm login` writes `auth.ini` — pnpm's `configDir`. `None` when
+    /// no home directory could be resolved. Resolved by
+    /// `default_config_dir`.
+    pub config_dir: Option<PathBuf>,
+
     pub package_manager_bootstrap: PackageManagerBootstrap,
 }
 
@@ -1768,6 +1784,7 @@ impl Config {
         // participates in the user-level path resolution below, and its
         // directory is where `auth.ini` lives.
         let global_config_dir = default_config_dir::<Sys>();
+        self.config_dir.clone_from(&global_config_dir);
         let mut global_settings =
             global_config_dir.as_deref().map(WorkspaceSettings::load_global).transpose()?.flatten();
         if let Some(global_settings) = global_settings.as_mut() {

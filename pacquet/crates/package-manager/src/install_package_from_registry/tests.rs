@@ -125,6 +125,8 @@ fn create_config(store_dir: &Path, modules_dir: &Path, virtual_store_dir: &Path)
         update_config: Default::default(),
         peer_dependency_rules: Default::default(),
         auth_headers: Default::default(),
+        auth_tokens_by_uri: Default::default(),
+        config_dir: None,
         proxy: Default::default(),
         tls: Default::default(),
         tls_by_uri: Default::default(),
