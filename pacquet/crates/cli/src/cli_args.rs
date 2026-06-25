@@ -1,5 +1,6 @@
 pub mod add;
 pub mod approve_builds;
+pub mod audit;
 pub mod cache;
 pub mod cat_file;
 pub mod cat_index;
@@ -7,10 +8,14 @@ pub mod create;
 pub mod dedupe;
 pub mod dlx;
 pub mod exec;
+pub mod fetch;
 pub mod find_hash;
+pub mod global;
 pub mod ignored_builds;
 pub mod import;
 pub mod install;
+pub mod link;
+pub mod list;
 pub mod logout;
 pub mod outdated;
 pub mod patch;
@@ -29,6 +34,7 @@ pub mod set_script;
 pub mod stop;
 pub mod store;
 pub mod supported_architectures;
+pub mod unlink;
 pub mod update;
 pub mod update_interactive;
 pub mod why;
@@ -36,6 +42,7 @@ pub mod why;
 use crate::{State, config_deps, config_overrides::ConfigOverrides};
 use add::AddArgs;
 use approve_builds::ApproveBuildsArgs;
+use audit::{AuditArgs, AuditOutcome};
 use cache::CacheCommand;
 use cat_file::CatFileArgs;
 use cat_index::CatIndexArgs;
@@ -44,10 +51,13 @@ use create::CreateArgs;
 use dedupe::DedupeArgs;
 use dlx::DlxArgs;
 use exec::ExecArgs;
+use fetch::FetchArgs;
 use find_hash::FindHashArgs;
 use ignored_builds::IgnoredBuildsArgs;
 use import::ImportArgs;
 use install::InstallArgs;
+use link::LinkArgs;
+use list::ListArgs;
 use logout::LogoutArgs;
 use miette::{Context, IntoDiagnostic};
 use outdated::{OutdatedArgs, OutdatedOutcome};
@@ -78,6 +88,7 @@ use std::{
 };
 use stop::StopArgs;
 use store::StoreCommand;
+use unlink::UnlinkArgs;
 use update::UpdateArgs;
 use why::WhyArgs;
 
@@ -170,6 +181,11 @@ pub enum CliCommand {
     Update(UpdateArgs),
     /// Check for outdated packages
     Outdated(OutdatedArgs),
+    /// Checks for known security issues with the installed packages.
+    Audit(AuditArgs),
+    /// List installed packages (global only for now).
+    #[clap(visible_alias = "ls")]
+    List(ListArgs),
     /// Shows the packages that depend on `pkg`
     Why(WhyArgs),
     /// Rebuild a package.
@@ -227,12 +243,20 @@ pub enum CliCommand {
     IgnoredBuilds(IgnoredBuildsArgs),
     /// Approve dependencies for running scripts during installation.
     ApproveBuilds(ApproveBuildsArgs),
+    /// Links a local package as a dependency
+    #[clap(visible_aliases = ["ln"])]
+    Link(LinkArgs),
     /// Generates a pnpm-lock.yaml from an external lockfile
     Import(ImportArgs),
     /// Deduplicate packages in the lockfile
     Dedupe(DedupeArgs),
     /// Remove extraneous packages
     Prune(PruneArgs),
+    /// Fetch packages from the lockfile into the virtual store
+    Fetch(FetchArgs),
+    /// Removes links to a local package and reinstalls it
+    #[clap(visible_aliases = ["dislink"])]
+    Unlink(UnlinkArgs),
     /// Log out of an npm registry.
     Logout(LogoutArgs),
 }
@@ -319,9 +343,12 @@ impl CliArgs {
                 | CliCommand::Remove(_)
                 | CliCommand::Install(_)
                 | CliCommand::Dlx(_)
+                | CliCommand::Link(_)
                 | CliCommand::Import(_)
                 | CliCommand::Dedupe(_)
                 | CliCommand::Prune(_)
+                | CliCommand::Fetch(_)
+                | CliCommand::Unlink(_)
                 | CliCommand::Create(_)
                 | CliCommand::Runtime(_)
                 // `rebuild` drives the frozen-install pipeline and emits
@@ -385,6 +412,20 @@ impl CliArgs {
                     PackageManifest::init(manifest_path_ref).wrap_err("initialize package.json");
                 Box::pin(std::future::ready(result))
             }
+            CliCommand::Add(args) if args.global => {
+                let config = config()?;
+                match reporter {
+                    ReporterType::Default | ReporterType::AppendOnly => {
+                        Box::pin(args.run_global::<DefaultReporter>(config, dir_ref))
+                    }
+                    ReporterType::Ndjson => {
+                        Box::pin(args.run_global::<NdjsonReporter>(config, dir_ref))
+                    }
+                    ReporterType::Silent => {
+                        Box::pin(args.run_global::<SilentReporter>(config, dir_ref))
+                    }
+                }
+            }
             CliCommand::Add(args) => {
                 let command_state = state(false)?;
                 match reporter {
@@ -393,6 +434,16 @@ impl CliArgs {
                     }
                     ReporterType::Ndjson => Box::pin(args.run::<NdjsonReporter>(command_state)),
                     ReporterType::Silent => Box::pin(args.run::<SilentReporter>(command_state)),
+                }
+            }
+            CliCommand::Update(args) if args.global => {
+                let config = config()?;
+                match reporter {
+                    ReporterType::Default | ReporterType::AppendOnly => {
+                        Box::pin(args.run_global::<DefaultReporter>(config))
+                    }
+                    ReporterType::Ndjson => Box::pin(args.run_global::<NdjsonReporter>(config)),
+                    ReporterType::Silent => Box::pin(args.run_global::<SilentReporter>(config)),
                 }
             }
             CliCommand::Update(args) => {
@@ -410,6 +461,15 @@ impl CliArgs {
             // install pipeline to dispatch on. It reports back whether any
             // dependency was outdated; process termination stays here, at
             // the top-level harness, rather than inside the command.
+            CliCommand::Outdated(args) if args.global => {
+                let config = config()?;
+                Box::pin(async move {
+                    if args.run_global(config).await? == OutdatedOutcome::Outdated {
+                        std::process::exit(1);
+                    }
+                    Ok(())
+                })
+            }
             CliCommand::Outdated(args) => {
                 let command_state = state(false)?;
                 Box::pin(async move {
@@ -419,7 +479,35 @@ impl CliArgs {
                     Ok(())
                 })
             }
+            CliCommand::Audit(args) => {
+                let command_state = state(true)?;
+                macro_rules! run_audit {
+                    ($reporter:ty) => {
+                        Box::pin(async move {
+                            if args.run::<$reporter>(command_state).await?
+                                == AuditOutcome::Vulnerable
+                            {
+                                std::process::exit(1);
+                            }
+                            Ok(())
+                        })
+                    };
+                }
+                match reporter {
+                    ReporterType::Default | ReporterType::AppendOnly => run_audit!(DefaultReporter),
+                    ReporterType::Ndjson => run_audit!(NdjsonReporter),
+                    ReporterType::Silent => run_audit!(SilentReporter),
+                }
+            }
+            CliCommand::List(args) => {
+                args.run(config()?)?;
+                Box::pin(std::future::ready(Ok(())))
+            }
             CliCommand::Why(args) => Box::pin(args.run(state(true)?)),
+            CliCommand::Remove(args) if args.global => {
+                global::handle_global_remove(config()?, &args.package_names)?;
+                Box::pin(std::future::ready(Ok(())))
+            }
             CliCommand::Remove(args) => {
                 let command_state = state(false)?;
                 match reporter {
@@ -682,6 +770,20 @@ impl CliArgs {
                 args.run(|| config().map(|m| &*m))?;
                 Box::pin(std::future::ready(Ok(())))
             }
+            CliCommand::Link(args) => {
+                let manifest_path = manifest_path_ref.clone();
+                match reporter {
+                    ReporterType::Default | ReporterType::AppendOnly => {
+                        Box::pin(args.run::<DefaultReporter>(config()?, manifest_path))
+                    }
+                    ReporterType::Ndjson => {
+                        Box::pin(args.run::<NdjsonReporter>(config()?, manifest_path))
+                    }
+                    ReporterType::Silent => {
+                        Box::pin(args.run::<SilentReporter>(config()?, manifest_path))
+                    }
+                }
+            }
             CliCommand::Dedupe(args) => Box::pin(async move {
                 let cfg = config()?;
                 let (config_root, package_manager_to_sync) =
@@ -713,6 +815,31 @@ impl CliArgs {
                     ReporterType::Silent => Box::pin(args.run::<SilentReporter>(command_state)),
                 }
             }
+            CliCommand::CatIndex(args) => Box::pin(async move {
+                args.run(dir_ref, || config().map(|m| &*m)).await?;
+                Ok(())
+            }),
+            CliCommand::Unlink(args) => {
+                let manifest_path = manifest_path_ref.clone();
+                match reporter {
+                    ReporterType::Default | ReporterType::AppendOnly => {
+                        Box::pin(args.run::<DefaultReporter>(config()?, manifest_path))
+                    }
+                    ReporterType::Ndjson => {
+                        Box::pin(args.run::<NdjsonReporter>(config()?, manifest_path))
+                    }
+                    ReporterType::Silent => {
+                        Box::pin(args.run::<SilentReporter>(config()?, manifest_path))
+                    }
+                }
+            }
+            CliCommand::Fetch(args) => match reporter {
+                ReporterType::Default | ReporterType::AppendOnly => {
+                    Box::pin(args.run::<DefaultReporter>(state(true)?))
+                }
+                ReporterType::Ndjson => Box::pin(args.run::<NdjsonReporter>(state(true)?)),
+                ReporterType::Silent => Box::pin(args.run::<SilentReporter>(state(true)?)),
+            },
             CliCommand::Prune(args) => Box::pin(async move {
                 let cfg = config()?;
                 let (config_root, package_manager_to_sync) =
@@ -736,10 +863,6 @@ impl CliArgs {
                         Box::pin(pipeline.run::<SilentReporter>()).await?;
                     }
                 }
-                Ok(())
-            }),
-            CliCommand::CatIndex(args) => Box::pin(async move {
-                args.run(dir_ref, || config().map(|m| &*m)).await?;
                 Ok(())
             }),
             CliCommand::IgnoredBuilds(_) => {

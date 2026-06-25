@@ -608,3 +608,349 @@ fn write_or_remove_manifest_reports_write_errors() {
 
     assert!(matches!(err, crate::UpdateWorkspaceManifestError::Write { .. }));
 }
+
+fn overrides(entries: &[(&str, &str)]) -> IndexMap<String, String> {
+    entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+/// Run `set_overrides` against `original` (when `Some`) and return the
+/// resulting file contents, or `None` when no file exists afterward.
+fn run_overrides(original: Option<&str>, entries: &IndexMap<String, String>) -> Option<String> {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join(WORKSPACE_MANIFEST_FILENAME);
+    if let Some(text) = original {
+        fs::write(&path, text).expect("seed manifest");
+    }
+    crate::set_overrides(
+        dir.path(),
+        entries.iter().map(|(key, value)| (key.as_str(), value.as_str())),
+    )
+    .expect("set_overrides succeeds");
+    fs::read_to_string(&path).ok()
+}
+
+/// Run `set_audit_ignore_ghsas` against `original` (when `Some`) and return
+/// the resulting file contents, or `None` when no file exists afterward.
+fn run_ignore_ghsas(original: Option<&str>, ghsas: &[&str]) -> Option<String> {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join(WORKSPACE_MANIFEST_FILENAME);
+    if let Some(text) = original {
+        fs::write(&path, text).expect("seed manifest");
+    }
+    let owned: Vec<String> = ghsas.iter().map(ToString::to_string).collect();
+    crate::set_audit_ignore_ghsas(dir.path(), &owned).expect("set_audit_ignore_ghsas succeeds");
+    fs::read_to_string(&path).ok()
+}
+
+/// Run `remove_overrides` against `original` and return the resulting file
+/// contents, or `None` when no file exists afterward.
+fn run_remove_overrides(original: Option<&str>, selectors: &[&str]) -> Option<String> {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join(WORKSPACE_MANIFEST_FILENAME);
+    if let Some(text) = original {
+        fs::write(&path, text).expect("seed manifest");
+    }
+    let selectors: Vec<String> = selectors.iter().copied().map(ToString::to_string).collect();
+    crate::remove_overrides(dir.path(), &selectors).expect("remove succeeds");
+    fs::read_to_string(&path).ok()
+}
+
+#[test]
+fn overrides_block_is_created() {
+    let out = run_overrides(None, &overrides(&[("foo@<1.0.1", "^1.0.1")])).expect("written");
+    assert_eq!(out, "overrides:\n  foo@<1.0.1: ^1.0.1\n");
+}
+
+#[test]
+fn overrides_quote_keys_and_values_that_need_it() {
+    let out =
+        run_overrides(None, &overrides(&[("@scope/foo@>=1.0.0", ">=1.0.1")])).expect("written");
+    assert_eq!(out, "overrides:\n  '@scope/foo@>=1.0.0': '>=1.0.1'\n");
+}
+
+#[test]
+fn overrides_merge_into_an_existing_block() {
+    let original = "overrides:\n  bar@1: 2\n";
+    let out =
+        run_overrides(Some(original), &overrides(&[("foo@<1.0.1", "^1.0.1")])).expect("written");
+    assert_eq!(out, "overrides:\n  bar@1: 2\n  foo@<1.0.1: ^1.0.1\n");
+}
+
+#[test]
+fn overrides_are_added_after_packages() {
+    let original = "packages:\n  - '*'\n";
+    let out =
+        run_overrides(Some(original), &overrides(&[("foo@<1.0.1", "^1.0.1")])).expect("written");
+    assert_eq!(out, "packages:\n  - '*'\noverrides:\n  foo@<1.0.1: ^1.0.1\n");
+}
+
+#[test]
+fn overrides_noop_when_already_present() {
+    let original = "overrides:\n  foo@<1.0.1: ^1.0.1\n";
+    let out =
+        run_overrides(Some(original), &overrides(&[("foo@<1.0.1", "^1.0.1")])).expect("written");
+    assert_eq!(out, original);
+}
+
+#[test]
+fn audit_config_block_is_created() {
+    let out = run_ignore_ghsas(None, &["GHSA-aaaa-bbbb-cccc"]).expect("written");
+    assert_eq!(out, "auditConfig:\n  ignoreGhsas:\n    - GHSA-aaaa-bbbb-cccc\n");
+}
+
+#[test]
+fn audit_config_block_with_multiple_ghsas() {
+    let out =
+        run_ignore_ghsas(None, &["GHSA-aaaa-bbbb-cccc", "GHSA-dddd-eeee-ffff"]).expect("written");
+    assert_eq!(
+        out,
+        "auditConfig:\n  ignoreGhsas:\n    - GHSA-aaaa-bbbb-cccc\n    - GHSA-dddd-eeee-ffff\n",
+    );
+}
+
+#[test]
+fn ignore_ghsas_replaces_an_existing_list() {
+    let original = "auditConfig:\n  ignoreGhsas:\n    - GHSA-aaaa-bbbb-cccc\n";
+    let out = run_ignore_ghsas(Some(original), &["GHSA-aaaa-bbbb-cccc", "GHSA-dddd-eeee-ffff"])
+        .expect("written");
+    assert_eq!(
+        out,
+        "auditConfig:\n  ignoreGhsas:\n    - GHSA-aaaa-bbbb-cccc\n    - GHSA-dddd-eeee-ffff\n",
+    );
+}
+
+#[test]
+fn ignore_ghsas_adds_key_to_existing_audit_config() {
+    let original = "auditConfig:\n  other: keep\n";
+    let out = run_ignore_ghsas(Some(original), &["GHSA-aaaa-bbbb-cccc"]).expect("written");
+    assert_eq!(out, "auditConfig:\n  ignoreGhsas:\n    - GHSA-aaaa-bbbb-cccc\n  other: keep\n");
+}
+
+#[test]
+fn ignore_ghsas_noop_when_already_present() {
+    let original = "auditConfig:\n  ignoreGhsas:\n    - GHSA-aaaa-bbbb-cccc\n";
+    let out = run_ignore_ghsas(Some(original), &["GHSA-aaaa-bbbb-cccc"]).expect("written");
+    assert_eq!(out, original);
+}
+
+#[test]
+fn ignore_ghsas_empty_removes_the_block() {
+    let original = "packages:\n  - '*'\nauditConfig:\n  ignoreGhsas:\n    - GHSA-aaaa-bbbb-cccc\n";
+    let out = run_ignore_ghsas(Some(original), &[]).expect("written");
+    assert_eq!(out, "packages:\n  - '*'\n");
+}
+
+#[test]
+fn ignore_ghsas_empty_preserves_sibling_audit_config_keys() {
+    let original = "auditConfig:\n  ignoreGhsas:\n    - GHSA-aaaa-bbbb-cccc\n  other: keep\n";
+    let out = run_ignore_ghsas(Some(original), &[]).expect("written");
+    assert_eq!(out, "auditConfig:\n  other: keep\n");
+}
+
+#[test]
+fn ignore_ghsas_empty_with_sibling_only_is_a_noop() {
+    let original = "auditConfig:\n  other: keep\n";
+    let out = run_ignore_ghsas(Some(original), &[]).expect("written");
+    assert_eq!(out, original);
+}
+
+#[test]
+fn ignore_ghsas_refuses_inline_flow_audit_config() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join(WORKSPACE_MANIFEST_FILENAME);
+    // A hand-written flow-style auditConfig: the block-splice writer can't
+    // safely edit it, so it must refuse instead of corrupting the file.
+    fs::write(&path, "auditConfig: { ignoreGhsas: [GHSA-aaaa-bbbb-cccc] }\n").expect("seed");
+
+    let err = crate::set_audit_ignore_ghsas(dir.path(), &["GHSA-dddd-eeee-ffff".to_string()])
+        .expect_err("must refuse an inline auditConfig");
+
+    assert!(matches!(err, crate::UpdateWorkspaceManifestError::UnsupportedInlineBlock { .. }));
+    let after = fs::read_to_string(&path).expect("read manifest");
+    assert_eq!(after, "auditConfig: { ignoreGhsas: [GHSA-aaaa-bbbb-cccc] }\n");
+}
+
+/// Run `set_minimum_release_age_excludes` against `original` and return the
+/// resulting file contents, or `None` when no file exists afterward.
+fn run_age_excludes(original: Option<&str>, excludes: &[&str]) -> Option<String> {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join(WORKSPACE_MANIFEST_FILENAME);
+    if let Some(text) = original {
+        fs::write(&path, text).expect("seed manifest");
+    }
+    let owned: Vec<String> = excludes.iter().map(ToString::to_string).collect();
+    crate::set_minimum_release_age_excludes(dir.path(), &owned)
+        .expect("set_minimum_release_age_excludes succeeds");
+    fs::read_to_string(&path).ok()
+}
+
+#[test]
+fn minimum_release_age_exclude_block_is_created() {
+    let out = run_age_excludes(None, &["foo@1.0.0", "bar@2.0.0"]).expect("written");
+    assert_eq!(out, "minimumReleaseAgeExclude:\n  - foo@1.0.0\n  - bar@2.0.0\n");
+}
+
+#[test]
+fn minimum_release_age_exclude_added_after_packages() {
+    let original = "packages:\n  - '*'\n";
+    let out = run_age_excludes(Some(original), &["foo@1.0.0"]).expect("written");
+    assert_eq!(out, "packages:\n  - '*'\nminimumReleaseAgeExclude:\n  - foo@1.0.0\n");
+}
+
+#[test]
+fn minimum_release_age_exclude_replaces_existing_block() {
+    let original = "minimumReleaseAgeExclude:\n  - foo@1.0.0\n";
+    let out = run_age_excludes(Some(original), &["foo@1.0.0", "bar@2.0.0"]).expect("written");
+    assert_eq!(out, "minimumReleaseAgeExclude:\n  - foo@1.0.0\n  - bar@2.0.0\n");
+}
+
+#[test]
+fn minimum_release_age_exclude_noop_when_unchanged() {
+    let original = "minimumReleaseAgeExclude:\n  - foo@1.0.0\n";
+    let out = run_age_excludes(Some(original), &["foo@1.0.0"]).expect("written");
+    assert_eq!(out, original);
+}
+
+#[test]
+fn minimum_release_age_exclude_empty_removes_the_block() {
+    let original = "packages:\n  - '*'\nminimumReleaseAgeExclude:\n  - foo@1.0.0\n";
+    let out = run_age_excludes(Some(original), &[]).expect("written");
+    assert_eq!(out, "packages:\n  - '*'\n");
+}
+
+#[test]
+fn set_overrides_refuses_to_clobber_a_non_scalar_value() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join(WORKSPACE_MANIFEST_FILENAME);
+    // A hand-written parent-scoped (object) override at the same selector key.
+    fs::write(&path, "overrides:\n  foo@<2.0.0:\n    bar: 1.0.0\n").expect("seed manifest");
+
+    let err = crate::set_overrides(dir.path(), [("foo@<2.0.0", "^2.0.0")])
+        .expect_err("must refuse to overwrite a non-scalar override");
+
+    assert!(matches!(err, crate::UpdateWorkspaceManifestError::OverrideConflict { .. }));
+    // The original object value is left untouched.
+    let after = fs::read_to_string(&path).expect("read manifest");
+    assert_eq!(after, "overrides:\n  foo@<2.0.0:\n    bar: 1.0.0\n");
+}
+
+#[test]
+fn set_overrides_refuses_inline_flow_block() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join(WORKSPACE_MANIFEST_FILENAME);
+    // A hand-written flow-style overrides block can't be block-spliced safely.
+    fs::write(&path, "overrides: { foo: 1.0.0 }\n").expect("seed manifest");
+
+    let err = crate::set_overrides(dir.path(), [("bar@<2.0.0", "^2.0.0")])
+        .expect_err("must refuse an inline overrides block");
+
+    assert!(matches!(err, crate::UpdateWorkspaceManifestError::UnsupportedInlineBlock { .. }));
+    let after = fs::read_to_string(&path).expect("read manifest");
+    assert_eq!(after, "overrides: { foo: 1.0.0 }\n");
+}
+
+#[test]
+fn ignore_ghsas_rejects_control_characters() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join(WORKSPACE_MANIFEST_FILENAME);
+
+    // A newline in the value would splice into a multi-line scalar.
+    let err = crate::set_audit_ignore_ghsas(dir.path(), &["GHSA-aaaa\nbreak".to_string()])
+        .expect_err("must reject a control character");
+
+    assert!(matches!(err, crate::UpdateWorkspaceManifestError::InvalidControlCharacter { .. }));
+    assert!(!path.exists(), "nothing should be written");
+}
+
+#[test]
+fn minimum_release_age_excludes_rejects_control_characters() {
+    let dir = TempDir::new().expect("temp dir");
+
+    let err =
+        crate::set_minimum_release_age_excludes(dir.path(), &["foo\r\nbar@1.0.0".to_string()])
+            .expect_err("must reject a control character");
+
+    assert!(matches!(err, crate::UpdateWorkspaceManifestError::InvalidControlCharacter { .. }));
+}
+
+#[test]
+fn set_overrides_rejects_control_characters() {
+    let dir = TempDir::new().expect("temp dir");
+
+    let err = crate::set_overrides(dir.path(), [("foo@<2.0.0\nx", "^2.0.0")])
+        .expect_err("must reject a control character");
+
+    assert!(matches!(err, crate::UpdateWorkspaceManifestError::InvalidControlCharacter { .. }));
+}
+
+#[test]
+fn remove_overrides_drops_only_the_named_entry() {
+    let original = "overrides:\n  foo: link:../foo\n  bar: link:../bar\n  baz: 1.0.0\n";
+    let out = run_remove_overrides(Some(original), &["foo"]).expect("file kept");
+    assert_eq!(out, "overrides:\n  bar: link:../bar\n  baz: 1.0.0\n");
+}
+
+#[test]
+fn remove_overrides_drops_the_block_when_emptied_but_keeps_siblings() {
+    let original = "packages:\n  - '*'\noverrides:\n  foo: link:../foo\n";
+    let out = run_remove_overrides(Some(original), &["foo"]).expect("file kept");
+    assert_eq!(out, "packages:\n  - '*'\n");
+}
+
+#[test]
+fn remove_overrides_deletes_the_file_when_nothing_remains() {
+    let original = "overrides:\n  foo: link:../foo\n  bar: link:../bar\n";
+    assert_eq!(run_remove_overrides(Some(original), &["foo", "bar"]), None);
+}
+
+#[test]
+fn remove_overrides_is_a_noop_for_absent_selectors() {
+    let original = "overrides:\n  foo: link:../foo\n";
+    let out = run_remove_overrides(Some(original), &["missing"]).expect("file kept");
+    assert_eq!(out, original);
+}
+
+#[test]
+fn remove_overrides_is_a_noop_when_the_manifest_is_missing() {
+    assert_eq!(run_remove_overrides(None, &["foo"]), None);
+}
+
+#[test]
+fn remove_overrides_handles_flow_style_mappings() {
+    let original = "overrides: { foo: link:../foo, bar: 1.0.0 }\n";
+    let out = run_remove_overrides(Some(original), &["foo"]).expect("file kept");
+    assert_eq!(out, "overrides:\n  bar: 1.0.0\n");
+}
+
+#[test]
+fn remove_overrides_drops_a_flow_style_block_when_emptied() {
+    let original = "packages:\n  - '*'\noverrides: { foo: link:../foo }\n";
+    let out = run_remove_overrides(Some(original), &["foo"]).expect("file kept");
+    assert_eq!(out, "packages:\n  - '*'\n");
+}
+
+#[test]
+fn remove_overrides_preserves_non_string_entries_in_block_style() {
+    let original = "overrides:\n  foo: link:../foo\n  bar:\n    nested: value\n";
+    let out = run_remove_overrides(Some(original), &["foo"]).expect("file kept");
+    assert_eq!(out, "overrides:\n  bar:\n    nested: value\n");
+}
+
+#[test]
+fn remove_overrides_keeps_block_when_only_non_string_entry_remains() {
+    // Removing the last string entry must not delete the block while a
+    // non-string entry (which the decoded map drops) is still present.
+    let original = "overrides:\n  foo: link:../foo\n  bar:\n    nested: value\n";
+    let out = run_remove_overrides(Some(original), &["foo"]).expect("file kept");
+    assert!(out.contains("bar:"), "non-string override must survive: {out}");
+}
+
+#[test]
+fn remove_overrides_leaves_flow_style_block_with_non_string_entries_untouched() {
+    // A flow-style block can only be rewritten wholesale, and the decoded map
+    // cannot reserialize the non-string `bar`, so the file is left as-is rather
+    // than dropping data.
+    let original = "overrides: { foo: link:../foo, bar: { nested: value } }\n";
+    let out = run_remove_overrides(Some(original), &["foo"]).expect("file kept");
+    assert_eq!(out, original);
+}

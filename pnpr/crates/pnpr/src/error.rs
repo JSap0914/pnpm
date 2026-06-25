@@ -110,6 +110,18 @@ pub enum RegistryError {
         reason: String,
     },
 
+    /// A publish targeted a `name@version` that is already hosted.
+    /// Published versions are immutable; npm and verdaccio both answer a
+    /// re-publish with 409 Conflict.
+    #[display("Cannot publish over the previously published version {package}@{version}")]
+    #[from(skip)]
+    VersionAlreadyPublished {
+        #[error(not(source))]
+        package: String,
+        #[error(not(source))]
+        version: String,
+    },
+
     #[display(
         "Package {package}@{version} is listed in the local OSV database as vulnerable ({advisories})"
     )]
@@ -176,7 +188,11 @@ pub enum RegistryError {
     Sqlx(sqlx::Error),
 
     /// SQL auth backend operation timed out.
-    #[cfg(any(feature = "backend-postgres", feature = "backend-mysql"))]
+    #[cfg(any(
+        feature = "backend-libsql",
+        feature = "backend-postgres",
+        feature = "backend-mysql"
+    ))]
     #[display("Auth database timeout")]
     AuthDatabaseTimeout,
 
@@ -213,6 +229,7 @@ impl RegistryError {
             RegistryError::Forbidden { .. } => "forbidden",
             RegistryError::InvalidAttachment { .. } => "invalid_attachment",
             RegistryError::BadRequest { .. } => "bad_request",
+            RegistryError::VersionAlreadyPublished { .. } => "version_already_published",
             RegistryError::OsvVulnerability { .. } => "osv_vulnerability",
             RegistryError::RegistrationDisabled => "registration_disabled",
             RegistryError::TooManyUsers { .. } => "too_many_users",
@@ -224,7 +241,11 @@ impl RegistryError {
             RegistryError::Libsql(_) => "libsql",
             #[cfg(any(feature = "backend-postgres", feature = "backend-mysql"))]
             RegistryError::Sqlx(_) => "sqlx",
-            #[cfg(any(feature = "backend-postgres", feature = "backend-mysql"))]
+            #[cfg(any(
+                feature = "backend-libsql",
+                feature = "backend-postgres",
+                feature = "backend-mysql"
+            ))]
             RegistryError::AuthDatabaseTimeout => "auth_database_timeout",
             RegistryError::JoinError(_) => "join_error",
             RegistryError::Io(_) => "io",
@@ -283,6 +304,7 @@ impl RegistryError {
             | RegistryError::InvalidConfig { .. }
             | RegistryError::InvalidAttachment { .. }
             | RegistryError::BadRequest { .. } => StatusCode::BAD_REQUEST,
+            RegistryError::VersionAlreadyPublished { .. } => StatusCode::CONFLICT,
             RegistryError::Unauthenticated { .. } => StatusCode::UNAUTHORIZED,
             RegistryError::Forbidden { .. } => StatusCode::FORBIDDEN,
             RegistryError::OsvVulnerability { .. } => StatusCode::FORBIDDEN,
@@ -298,7 +320,11 @@ impl RegistryError {
             RegistryError::Libsql(_) => StatusCode::INTERNAL_SERVER_ERROR,
             #[cfg(any(feature = "backend-postgres", feature = "backend-mysql"))]
             RegistryError::Sqlx(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            #[cfg(any(feature = "backend-postgres", feature = "backend-mysql"))]
+            #[cfg(any(
+                feature = "backend-libsql",
+                feature = "backend-postgres",
+                feature = "backend-mysql"
+            ))]
             RegistryError::AuthDatabaseTimeout => StatusCode::GATEWAY_TIMEOUT,
             RegistryError::Io(_) | RegistryError::ObjectStore(_) | RegistryError::Json(_) => {
                 StatusCode::BAD_GATEWAY

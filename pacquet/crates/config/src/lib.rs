@@ -1,14 +1,19 @@
 mod api;
 mod defaults;
 mod env_overlay;
+mod global_bin_check;
 pub mod matcher;
 mod npmrc_auth;
 mod store_path;
 pub mod version_policy;
 mod workspace_yaml;
 
-pub use crate::api::{EnvVar, EnvVarOs, GetCurrentDir, GetHomeDir, Host, LinkProbe};
+pub use crate::{
+    api::{EnvVar, EnvVarOs, GetCurrentDir, GetHomeDir, Host, LinkProbe},
+    global_bin_check::{CheckGlobalBinDirError, check_global_bin_dir},
+};
 
+use crate::npmrc_auth::NpmrcAuth;
 use indexmap::IndexMap;
 use pacquet_patching::{
     CalcPatchHashError, PatchGroupRecord, ResolvePatchedDependenciesError, calc_patch_hashes,
@@ -26,9 +31,10 @@ use std::{
 };
 
 pub use crate::defaults::{
-    PACQUET_VERSION, available_parallelism, default_git_shallow_hosts,
-    default_peers_suffix_max_length, default_unsafe_perm, default_virtual_store_dir_max_length,
-    default_workspace_concurrency, is_unsafe_perm_posix, resolve_child_concurrency,
+    GLOBAL_LAYOUT_VERSION, PACQUET_VERSION, available_parallelism, default_git_shallow_hosts,
+    default_peers_suffix_max_length, default_pnpm_home_dir, default_unsafe_perm,
+    default_virtual_store_dir_max_length, default_workspace_concurrency, is_unsafe_perm_posix,
+    resolve_child_concurrency,
 };
 use crate::defaults::{
     default_cache_dir, default_child_concurrency, default_config_dir,
@@ -112,6 +118,30 @@ pub enum TrustPolicy {
     #[default]
     Off,
     NoDowngrade,
+}
+
+/// Minimum advisory severity shown by `pnpm audit`.
+///
+/// Mirrors `Config.auditLevel` in pnpm's config reader. The command-level
+/// default is `low`, so [`Config::audit_level`] stays optional and the audit
+/// command applies the fallback when the setting is unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditLevel {
+    Info,
+    Low,
+    Moderate,
+    High,
+    Critical,
+}
+
+/// `auditConfig` from `pnpm-workspace.yaml`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AuditConfig {
+    /// GHSA identifiers that `pnpm audit` should suppress in the rendered
+    /// report.
+    pub ignore_ghsas: Vec<String>,
 }
 
 /// Tri-state mirror of `pacquet_executor::ScriptsPrependNodePath`
@@ -370,7 +400,7 @@ pub enum PackageImportMethod {
 /// onto `Config` field-by-field, mirroring pnpm 11's split between
 /// `.npmrc` (auth/registry/network) and `pnpm-workspace.yaml`
 /// (project-structural settings).
-#[derive(Debug, SmartDefault)]
+#[derive(Debug, Clone, SmartDefault)]
 pub struct Config {
     /// When true, all dependencies are hoisted to `node_modules/.pnpm/node_modules`.
     /// This makes unlisted dependencies accessible to all packages inside `node_modules`.
@@ -500,6 +530,29 @@ pub struct Config {
     /// [`virtual_store_dir`]: Self::virtual_store_dir
     #[default(_code = "default_virtual_store_dir()")]
     pub global_virtual_store_dir: PathBuf,
+
+    /// User override for the global packages root (`global-dir` setting /
+    /// `PNPM_CONFIG_GLOBAL_DIR`). When unset, [`Config::current`] derives
+    /// the root from the pnpm home directory. Mirrors pnpm's
+    /// `Config.globalDir`.
+    pub global_dir: Option<PathBuf>,
+
+    /// User override for the global bin directory (`global-bin-dir` setting
+    /// / `PNPM_CONFIG_GLOBAL_BIN_DIR`). When unset, [`Config::current`]
+    /// derives it as `<pnpm-home>/bin`. Mirrors pnpm's `Config.globalBinDir`.
+    pub global_bin_dir: Option<PathBuf>,
+
+    /// The resolved global packages directory,
+    /// `(global_dir ?? <pnpm-home>/global)/v11`. Populated by
+    /// [`Config::current`]; `None` when the pnpm home directory cannot be
+    /// determined and no override is set. Mirrors pnpm's
+    /// `Config.globalPkgDir`.
+    pub global_pkg_dir: Option<PathBuf>,
+
+    /// The resolved global bin directory, `global_bin_dir ?? <pnpm-home>/bin`.
+    /// Populated by [`Config::current`]; global add/remove/update require it
+    /// (pnpm's `NO_GLOBAL_BIN_DIR` when absent). Mirrors pnpm's `Config.bin`.
+    pub global_bin: Option<PathBuf>,
 
     /// Controls the way packages are imported from the store (if you want to disable symlinks
     /// inside `node_modules`, then you need to change the node-linker setting, not this one).
@@ -1345,6 +1398,12 @@ pub struct Config {
     /// [`TrustPolicy`].
     pub trust_policy: TrustPolicy,
 
+    /// `audit-level` / `auditLevel` config for `pnpm audit`.
+    pub audit_level: Option<AuditLevel>,
+
+    /// `auditConfig` config for `pnpm audit`.
+    pub audit_config: AuditConfig,
+
     /// Glob-style `name[@version]` patterns that opt specific packages
     /// out of the [`trust_policy`] check. Mirrors pnpm's
     /// [`trustPolicyExclude`](https://github.com/pnpm/pnpm/blob/2a9bd897bf/config/reader/src/Config.ts#L271).
@@ -1853,15 +1912,14 @@ impl Config {
         // project `.npmrc` > `auth.ini` > user-level `.npmrc`. Each is
         // parsed and rescoped independently before being folded together.
         let parse_trusted_source = |text: String, dir: PathBuf, label: &str| {
-            let mut auth = crate::npmrc_auth::NpmrcAuth::from_ini::<Sys>(&text, &dir);
+            let mut auth = NpmrcAuth::from_ini::<Sys>(&text, &dir);
             auth.rescope_unscoped(label);
             auth
         };
         let project_npmrc_dir =
             workspace_yaml.as_ref().map_or(start_dir, |(base_dir, _)| base_dir.as_path());
         let project_source = read_npmrc(project_npmrc_dir).map(|text| {
-            let mut auth =
-                crate::npmrc_auth::NpmrcAuth::from_project_ini::<Sys>(&text, project_npmrc_dir);
+            let mut auth = NpmrcAuth::from_project_ini::<Sys>(&text, project_npmrc_dir);
             auth.rescope_unscoped("<project>/.npmrc");
             auth
         });
@@ -1890,20 +1948,42 @@ impl Config {
         // `.npmrc` — mirroring the env-over-workspace ordering in pnpm's
         // [`loadNpmrcFiles.ts`](https://github.com/pnpm/pnpm/blob/main/config/reader/src/loadNpmrcFiles.ts).
         let env_scoped_source = {
-            let auth = crate::npmrc_auth::NpmrcAuth::from_url_scoped_env::<Sys>();
+            let auth = NpmrcAuth::from_url_scoped_env::<Sys>();
             (!auth.creds_by_scope_by_uri.is_empty()).then_some(auth)
         };
 
+        // Structured `_auth` registry auth from its two trusted sources:
+        // the `pnpm_config__auth` env var and the global `config.yaml`'s
+        // `_auth` key (env wins on conflict). See `from_json_sources`.
+        let json_auth = global_settings
+            .as_ref()
+            .and_then(|settings| settings.auth.as_ref())
+            .pipe(NpmrcAuth::from_json_sources::<Sys>)
+            .map_err(|source| LoadWorkspaceYamlError::InvalidJsonAuth { source })?;
+        let json_auth_has_content = !json_auth.creds_by_scope_by_uri.is_empty()
+            || !json_auth.json_env_registries.is_empty();
+        let env_json_source = json_auth_has_content.then_some(json_auth);
+
         // Capture the trusted sources (everything but `project_source`) for
         // [`PackageManagerBootstrap`] before the fold below consumes them.
-        let trusted_sources =
-            [env_scoped_source.clone(), auth_ini_source.clone(), user_source.clone()];
+        let trusted_sources = [
+            env_json_source.clone(),
+            env_scoped_source.clone(),
+            auth_ini_source.clone(),
+            user_source.clone(),
+        ];
 
         // Fold high-priority-first: the first present source is the
         // base, each lower source fills the gaps it left
-        // ([`NpmrcAuth::merge_under`]).
+        // ([`NpmrcAuth::merge_under`]). `env_json_source` is listed before
+        // `env_scoped_source` so the JSON env var wins on the rare occasion
+        // both define the same `//host/:_authToken` key — matches pnpm's
+        // TS merge, where JSON auth is spread after `envScopedConfig` so
+        // later wins.
         let mut sources =
-            [env_scoped_source, project_source, auth_ini_source, user_source].into_iter().flatten();
+            [env_json_source, env_scoped_source, project_source, auth_ini_source, user_source]
+                .into_iter()
+                .flatten();
         let mut npmrc_auth = sources.next().unwrap_or_default();
         for lower in sources {
             npmrc_auth.merge_under(lower);
@@ -2025,6 +2105,12 @@ impl Config {
             }
         }
 
+        // Apply `_auth` routes after workspace yaml (so they win over
+        // repo-controlled registries) but before `PNPM_CONFIG_*` (so an
+        // explicit `pnpm_config_registry` / `--registry` still wins) —
+        // pnpm's "CLI > _auth > yaml" precedence.
+        npmrc_auth.apply_json_env_registries(&mut self);
+
         // Apply `PNPM_CONFIG_*` env vars *after* `pnpm-workspace.yaml`,
         // mirroring pnpm v11's loop at
         // [`config/reader/src/index.ts:471-488`](https://github.com/pnpm/pnpm/blob/2a9bd897bf/config/reader/src/index.ts#L471-L488):
@@ -2052,8 +2138,11 @@ impl Config {
         env_settings.apply_to(&mut self, start_dir);
         self.workspace_dir = saved_workspace_dir;
         if let Some(registry) = env_registry_override {
-            self.package_manager_bootstrap.registry =
+            let normalized =
                 if registry.ends_with('/') { registry } else { format!("{registry}/") };
+            self.registries.insert("default".to_string(), normalized.clone());
+            self.package_manager_bootstrap.registry.clone_from(&normalized);
+            self.package_manager_bootstrap.registries.insert("default".to_string(), normalized);
         }
 
         // Build the per-URI auth-header lookup. Credentials were already
@@ -2105,6 +2194,28 @@ impl Config {
             global_virtual_store_dir_explicit,
         );
 
+        // Resolve the global install directories. Mirrors pnpm's
+        // [`index.ts:358-376`](https://github.com/pnpm/pnpm/blob/1819226b51/config/reader/src/index.ts#L358-L376):
+        // `globalPkgDir = (globalDir ?? <pnpm-home>/global)/v11` and
+        // `bin = globalBinDir ?? <pnpm-home>/bin`.
+        if self.global_dir.is_none() {
+            self.global_dir = read_pnpm_env::<Sys>("global_dir", "GLOBAL_DIR").map(PathBuf::from);
+        }
+        if self.global_bin_dir.is_none() {
+            self.global_bin_dir =
+                read_pnpm_env::<Sys>("global_bin_dir", "GLOBAL_BIN_DIR").map(PathBuf::from);
+        }
+        let pnpm_home_dir = default_pnpm_home_dir::<Sys>();
+        let global_dir_root = self
+            .global_dir
+            .clone()
+            .or_else(|| pnpm_home_dir.as_ref().map(|home| home.join("global")));
+        self.global_pkg_dir = global_dir_root.map(|root| root.join(GLOBAL_LAYOUT_VERSION));
+        self.global_bin = self
+            .global_bin_dir
+            .clone()
+            .or_else(|| pnpm_home_dir.as_ref().map(|home| home.join("bin")));
+
         Ok(self)
     }
 
@@ -2119,13 +2230,14 @@ impl Config {
 /// full config uses so the bootstrap cascade matches the project cascade
 /// minus the repository-controlled sources.
 fn build_package_manager_bootstrap<Sys: EnvVar>(
-    mut trusted_auth: crate::npmrc_auth::NpmrcAuth,
+    mut trusted_auth: NpmrcAuth,
 ) -> PackageManagerBootstrap {
     // The full-config fold already surfaced these sources' `${VAR}` warnings;
     // drop the duplicates this second pass would log.
     trusted_auth.warnings.clear();
     let mut config = Config::default();
     trusted_auth.apply_registry_and_warn(&mut config);
+    trusted_auth.apply_json_env_registries(&mut config);
     trusted_auth.apply_proxy_cascade::<Sys>(&mut config);
     trusted_auth.apply_tls_and_local_address(&mut config);
     trusted_auth.build_auth_headers(&mut config);

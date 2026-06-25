@@ -23,6 +23,7 @@ pacquet-pnpr-client                       = { workspace = true }
 pacquet-env-installer                     = { workspace = true }
 pacquet-executor                          = { workspace = true }
 pacquet-fs                                = { workspace = true }
+pacquet-global                            = { workspace = true }
 pacquet-graph-hasher                      = { workspace = true }
 pacquet-hooks                             = { workspace = true }
 pacquet-lockfile                          = { workspace = true }
@@ -38,6 +39,7 @@ pacquet-registry                          = { workspace = true }
 pacquet-reporter                          = { workspace = true }
 pacquet-resolving-npm-resolver            = { workspace = true }
 pacquet-resolving-parse-wanted-dependency = { workspace = true }
+pacquet-resolving-resolver-base           = { workspace = true }
 pacquet-store-dir                         = { workspace = true }
 pacquet-tarball                           = { workspace = true }
 pacquet-diagnostics                       = { workspace = true }
@@ -57,8 +59,10 @@ indexmap             = { workspace = true }
 node-semver          = { workspace = true }
 miette               = { workspace = true }
 owo-colors.workspace = true
+pathdiff             = { workspace = true }
 pipe-trait           = { workspace = true }
 rayon                = { workspace = true }
+reqwest              = { workspace = true }
 rmp-serde            = { workspace = true }
 serde                = { workspace = true }
 serde_json           = { workspace = true }

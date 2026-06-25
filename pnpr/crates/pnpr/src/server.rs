@@ -1501,9 +1501,22 @@ struct ValidatedPublish {
     name: PackageName,
     /// The publish body with `_attachments` stripped.
     incoming: Value,
-    /// One `(attachment, canonical disk filename, dist)` triple per
-    /// attachment.
-    prepared: Vec<(PendingAttachment, String, Value)>,
+    /// One entry per attachment.
+    prepared: Vec<PreparedAttachment>,
+}
+
+/// One publish attachment resolved to its canonical on-disk filename and its
+/// `versions[version].dist` block.
+struct PreparedAttachment {
+    attachment: PendingAttachment,
+    /// Canonical on-disk filename.
+    canonical: String,
+    /// The version this attachment publishes, parsed from its filename.
+    /// Lets the re-publish guard tell a content publish from a metadata-only
+    /// update (which carries no attachments).
+    version: String,
+    /// The matching `dist` block, or `Value::Null` when absent.
+    dist: Value,
 }
 
 async fn validate_publish_doc(
@@ -1524,8 +1537,7 @@ async fn validate_publish_doc(
     // scoped libnpmpublish bodies the wire form is `@scope/name-version.tgz`
     // but on disk it lives at `<root>/@scope/name/name-version.tgz`,
     // matching what `serve_tarball` expects.
-    let mut prepared: Vec<(PendingAttachment, String, Value)> =
-        Vec::with_capacity(attachments.len());
+    let mut prepared: Vec<PreparedAttachment> = Vec::with_capacity(attachments.len());
     for attachment in attachments {
         let (canonical, version) = name.parse_tarball_name(&attachment.filename)?;
         let dist = incoming
@@ -1534,7 +1546,7 @@ async fn validate_publish_doc(
             .and_then(|manifest| manifest.get("dist"))
             .cloned()
             .unwrap_or(Value::Null);
-        prepared.push((attachment, canonical, dist));
+        prepared.push(PreparedAttachment { attachment, canonical, version, dist });
     }
     Ok(ValidatedPublish { name, incoming, prepared })
 }
@@ -1560,6 +1572,61 @@ async fn stage_publish(
 ) -> Result<StagedPublish, RegistryError> {
     let ValidatedPublish { name, incoming, prepared } = doc;
 
+    let hosted_bytes = state.inner.storage.read_hosted_packument(&name).await?;
+    let hosted: Option<Value> = match hosted_bytes.as_deref().map(serde_json::from_slice) {
+        Some(Ok(value)) => Some(value),
+        Some(Err(err)) => return Err(RegistryError::Json(err)),
+        None => None,
+    };
+
+    // Validate each incoming version against the locally hosted packument
+    // (a hosted packument is served as-is, so anything not in it is genuinely
+    // new here, even if it exists upstream):
+    //
+    // * Already hosted — published content is immutable, so reject a *content*
+    //   re-publish with 409 (as npm/verdaccio do): one that carries a new
+    //   tarball (an attachment) or changes `dist.integrity` (the content
+    //   anchor; the `tarball` URL is rewritten on read, so don't compare it).
+    //   A clash that does neither is a metadata-only update (`pnpm deprecate`),
+    //   which is allowed — `merge_versions` keeps the hosted `dist`.
+    // * New — it must ship a tarball. A version entry with no attachment would
+    //   be advertised with no hosted tarball (installs 404) and would block a
+    //   later real publish of it (409): reject with 400.
+    let attachment_versions: HashSet<&str> =
+        prepared.iter().map(|attachment| attachment.version.as_str()).collect();
+    let hosted_versions =
+        hosted.as_ref().and_then(|h| h.get("versions")).and_then(Value::as_object);
+    if let Some(incoming_versions) = incoming.get("versions").and_then(Value::as_object) {
+        for (version, incoming_manifest) in incoming_versions {
+            let has_attachment = attachment_versions.contains(version.as_str());
+            match hosted_versions.and_then(|hosted| hosted.get(version)) {
+                Some(hosted_manifest) => {
+                    let incoming_integrity =
+                        incoming_manifest.pointer("/dist/integrity").and_then(Value::as_str);
+                    let hosted_integrity =
+                        hosted_manifest.pointer("/dist/integrity").and_then(Value::as_str);
+                    let integrity_changed = incoming_integrity
+                        .is_some_and(|integrity| Some(integrity) != hosted_integrity);
+                    if has_attachment || integrity_changed {
+                        return Err(RegistryError::VersionAlreadyPublished {
+                            package: name.as_str().to_string(),
+                            version: version.clone(),
+                        });
+                    }
+                }
+                None if !has_attachment => {
+                    return Err(RegistryError::BadRequest {
+                        reason: format!(
+                            "cannot publish version {version} of {:?} without a tarball",
+                            name.as_str(),
+                        ),
+                    });
+                }
+                None => {}
+            }
+        }
+    }
+
     // Seed the merge from whatever the upstream knows about the
     // package, not just from a cold cache. Without this, a publish
     // of a brand-new version of an upstream-only package would
@@ -1567,7 +1634,7 @@ async fn stage_publish(
     // would mask every upstream version + dist-tag on subsequent
     // reads. `update_dist_tag` already does the same fallback —
     // we just mirror it here.
-    let existing_bytes = match state.inner.storage.read_hosted_packument(&name).await? {
+    let existing_bytes = match hosted_bytes {
         Some(bytes) => Some(bytes),
         None => match load_packument_bytes(state, &name).await {
             PackumentLoad::Ok(bytes) => Some(bytes),
@@ -1580,7 +1647,7 @@ async fn stage_publish(
         Some(Err(err)) => return Err(RegistryError::Json(err)),
         None => None,
     };
-    let merged = merge_manifest(existing.as_ref(), &incoming, now_iso);
+    let merged = merge_manifest(existing.as_ref(), &incoming, hosted.as_ref(), now_iso);
     let merged_bytes = serde_json::to_vec_pretty(&merged).map_err(RegistryError::Json)?;
     // `incoming` is no longer needed; drop it so the base64 strings
     // inside go away as soon as `prepared` (which owns each one) is
@@ -1592,7 +1659,7 @@ async fn stage_publish(
     // 400; any tmp files written before the failure get removed
     // along the way so a bad upload leaves no on-disk artifact.
     let mut written_slots = Vec::with_capacity(prepared.len());
-    for (attachment, canonical, dist) in prepared {
+    for PreparedAttachment { attachment, canonical, version: _, dist } in prepared {
         let slot = match state.inner.storage.reserve_hosted_tarball(&name, &canonical).await {
             Ok(slot) => slot,
             Err(err) => {
@@ -1820,10 +1887,12 @@ async fn augment_search_with_upstream(state: &AppState, query: &str, body: &mut 
 /// `PUT /:pkg/-rev/:rev` — overwrite the on-disk packument with the
 /// client-supplied body. pnpm uses this in the partial-unpublish
 /// flow: it fetches the packument, removes the unpublished version
-/// from `versions` / `dist-tags`, then PUTs the result back. We
-/// trust the body verbatim — the same trust verdaccio extends — and
-/// strip any `_attachments` so we don't persist base64 payloads
-/// alongside the manifest.
+/// from `versions` / `dist-tags`, then PUTs the result back. We strip
+/// any `_attachments` so we don't persist base64 payloads alongside
+/// the manifest, and run [`enforce_published_version_immutability`] so
+/// the body can't tamper with a published version's `dist` or smuggle
+/// in a new one — everything else in the body is trusted verbatim, the
+/// same trust verdaccio extends.
 async fn update_packument(
     state: &AppState,
     identity: &Identity,
@@ -1843,19 +1912,35 @@ async fn update_packument(
         Ok(v) => v,
         Err(err) => return error_response(&RegistryError::Json(err)),
     };
+    // The write destination is the URL package name; a mismatched body name
+    // would otherwise land under the URL package and persist an inconsistent
+    // manifest.
+    if let Some(body_name) = packument.get("name").and_then(Value::as_str)
+        && body_name != name.as_str()
+    {
+        return error_response(&RegistryError::BadRequest {
+            reason: format!(
+                "packument name {body_name:?} does not match the URL package {:?}",
+                name.as_str(),
+            ),
+        });
+    }
     if let Some(obj) = packument.as_object_mut() {
         obj.remove("_attachments");
         obj.remove("_rev");
         obj.remove("_revisions");
     }
-    let bytes = match serde_json::to_vec_pretty(&packument) {
-        Ok(b) => b,
-        Err(err) => return error_response(&RegistryError::Json(err)),
-    };
     // Serialize the write against this instance's other same-package
     // packument writers (publish / dist-tag), so the client-supplied
     // rewrite can't interleave with a concurrent merge.
     let _packument_guard = state.inner.package_locks.lock(name.as_str()).await;
+    if let Some(err) = enforce_published_version_immutability(state, &name, &mut packument).await {
+        return error_response(&err);
+    }
+    let bytes = match serde_json::to_vec_pretty(&packument) {
+        Ok(b) => b,
+        Err(err) => return error_response(&RegistryError::Json(err)),
+    };
     if let Err(err) = state.inner.storage.write_hosted_packument(&name, &bytes).await {
         return error_response(&err);
     }
@@ -1866,6 +1951,157 @@ async fn update_packument(
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(bytes))
         .expect("static-shape response always builds")
+}
+
+/// Hold a published version's security-critical `dist` fields immutable across
+/// the partial-unpublish `PUT`, which otherwise persists the body verbatim.
+/// [`expected_tarball_dist`] resolves a tarball request to a version by
+/// `dist.tarball` basename and verifies the bytes against that version's string
+/// `dist.integrity`, so letting either drift — while the bytes on disk stay put —
+/// breaks installs of that version (`EINTEGRITY`, or a 404/502 redirect).
+///
+/// For each version in the body, given a hosted packument: changing the
+/// `dist.integrity` or `dist.tarball` basename of an already-published version is
+/// rejected; omitting either is repaired from the hosted value (the round-trip
+/// drops them on retained versions); and a version not already published is
+/// rejected — this endpoint only removes versions, and an added entry could
+/// collide a basename or seed a tarball-less one. A `PUT` to a package with no
+/// hosted packument is rejected outright (nothing to unpublish, and the write
+/// would seed versions that publish can never overwrite).
+///
+/// Returns the rejection, or `None` when the body is acceptable (after any
+/// restores). Must hold the package lock so a concurrent publish can't race it.
+async fn enforce_published_version_immutability(
+    state: &AppState,
+    name: &PackageName,
+    incoming: &mut Value,
+) -> Option<RegistryError> {
+    let hosted: Value = match state.inner.storage.read_hosted_packument(name).await {
+        // Fail closed: a corrupt packument must not silently disable the gate.
+        Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(err) => return Some(RegistryError::Json(err)),
+        },
+        Ok(None) => {
+            return Some(RegistryError::BadRequest {
+                reason: format!(
+                    "cannot update {:?}: it has no published packument to unpublish from",
+                    name.as_str(),
+                ),
+            });
+        }
+        Err(err) => return Some(err),
+    };
+    // None (no versions to enforce) means "accept", not "error" here.
+    let incoming_versions = incoming.get("versions").and_then(Value::as_object)?;
+    let hosted_versions = hosted.get("versions").and_then(Value::as_object);
+    // Fields to re-insert after the scan; deferred because the scan borrows
+    // `incoming` and the restore mutates it.
+    let mut restore: Vec<(String, &'static str, Value)> = Vec::new();
+    for (version, manifest) in incoming_versions {
+        let Some(existing) = hosted_versions.and_then(|versions| versions.get(version)) else {
+            return Some(RegistryError::BadRequest {
+                reason: format!(
+                    "version {version:?} is not in the published package; this endpoint removes versions, it does not add them",
+                ),
+            });
+        };
+        // A present dist.integrity must be a string; a non-string would slip past
+        // the string-only checks below.
+        let incoming_integrity = match manifest.get("dist").and_then(|dist| dist.get("integrity")) {
+            None => None,
+            Some(Value::String(value)) => Some(value.as_str()),
+            Some(_) => {
+                return Some(RegistryError::BadRequest {
+                    reason: format!("dist.integrity for version {version:?} must be a string"),
+                });
+            }
+        };
+        let existing_dist = existing.get("dist");
+        let existing_integrity =
+            existing_dist.and_then(|dist| dist.get("integrity")).and_then(Value::as_str);
+        match (existing_integrity, incoming_integrity) {
+            (Some(stored), Some(submitted)) if stored != submitted => {
+                return Some(RegistryError::BadRequest {
+                    reason: format!(
+                        "dist.integrity for the published version {version:?} is immutable",
+                    ),
+                });
+            }
+            (Some(stored), None) => {
+                if let Some(err) = require_object_dist(manifest, version) {
+                    return Some(err);
+                }
+                restore.push((version.clone(), "integrity", Value::String(stored.to_string())));
+            }
+            _ => {}
+        }
+        // Compare basenames, not URLs: the round-trip carries the rewritten URL
+        // (see [`rewrite_tarball_urls`]) while the hosted side keeps the original,
+        // and [`served_tarball_basename`] applies the same version-derived
+        // fallback so a basename-less stored URL is still pinned.
+        let existing_tarball = existing_dist.and_then(|dist| dist.get("tarball"));
+        if let Some(stored_basename) = served_tarball_basename(existing, name) {
+            let incoming_basename = manifest
+                .get("dist")
+                .and_then(|dist| dist.get("tarball"))
+                .and_then(Value::as_str)
+                .and_then(tarball_basename);
+            match incoming_basename {
+                Some(submitted) if submitted != stored_basename => {
+                    return Some(RegistryError::BadRequest {
+                        reason: format!(
+                            "dist.tarball for the published version {version:?} is immutable",
+                        ),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    if let Some(err) = require_object_dist(manifest, version) {
+                        return Some(err);
+                    }
+                    let stored = existing_tarball.cloned().unwrap_or(Value::Null);
+                    restore.push((version.clone(), "tarball", stored));
+                }
+            }
+        }
+    }
+    for (version, key, value) in restore {
+        if let Some(dist) = incoming
+            .get_mut("versions")
+            .and_then(|versions| versions.get_mut(&version))
+            .and_then(|manifest| manifest.get_mut("dist"))
+            .and_then(Value::as_object_mut)
+        {
+            dist.insert(key.to_string(), value);
+        }
+    }
+    None
+}
+
+/// The tarball basename a version is actually served under, mirroring
+/// [`rewrite_tarball_urls`]: the `dist.tarball` URL's own basename when it has
+/// one, otherwise the version-derived canonical name the rewrite falls back to.
+/// Returns `None` when the manifest carries no string `dist.tarball` to serve.
+fn served_tarball_basename(manifest: &Value, pkg: &PackageName) -> Option<String> {
+    let url = manifest.get("dist").and_then(|dist| dist.get("tarball")).and_then(Value::as_str)?;
+    if let Some(basename) = tarball_basename(url) {
+        return Some(basename.to_owned());
+    }
+    let version = manifest.get("version").and_then(Value::as_str)?;
+    Some(pkg.tarball_name_for_version(version))
+}
+
+/// Reject a published version whose `dist` isn't an object: a restore needs an
+/// object to write into, so otherwise it would no-op and persist the version
+/// without the field — the stripping this guards against.
+fn require_object_dist(manifest: &Value, version: &str) -> Option<RegistryError> {
+    if manifest.get("dist").is_some_and(Value::is_object) {
+        return None;
+    }
+    Some(RegistryError::BadRequest {
+        reason: format!("dist for the published version {version:?} must be an object"),
+    })
 }
 
 /// `DELETE /:pkg/-rev/:rev` — remove the entire package directory,

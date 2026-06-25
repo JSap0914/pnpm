@@ -1,7 +1,7 @@
 use crate::{
-    CatalogMode, Config, HoistingLimits, LinkWorkspacePackages, NodeLinker, NodePackageMapType,
-    PackageImportMethod, ResolutionMode, ScriptsPrependNodePath, TrustPolicy, api::EnvVar,
-    resolve_child_concurrency,
+    AuditConfig, AuditLevel, CatalogMode, Config, HoistingLimits, LinkWorkspacePackages,
+    NodeLinker, NodePackageMapType, PackageImportMethod, ResolutionMode, ScriptsPrependNodePath,
+    TrustPolicy, api::EnvVar, resolve_child_concurrency,
 };
 use derive_more::{Display, Error};
 use indexmap::IndexMap;
@@ -113,6 +113,14 @@ pub struct WorkspaceSettings {
     /// [`namedRegistries`](https://github.com/pnpm/pnpm/blob/b61e268d57/config/reader/src/Config.ts#L227)
     /// setting.
     pub named_registries: Option<BTreeMap<String, String>>,
+
+    /// Structured registry auth (`_auth`). Honored **only** from the global
+    /// pnpm `config.yaml` (read via `NpmrcAuth::from_json_sources`, not
+    /// applied in [`Self::apply_to`]) — never a project file, so repo config
+    /// can't supply credentials. A raw [`serde_json::Value`] so the auth
+    /// parser is the single validator of its shape.
+    #[serde(rename = "_auth")]
+    pub auth: Option<serde_json::Value>,
 
     pub auto_install_peers: Option<bool>,
     pub auto_install_peers_from_highest_match: Option<bool>,
@@ -374,6 +382,12 @@ pub struct WorkspaceSettings {
     /// `trustPolicy` from `pnpm-workspace.yaml`. See [`TrustPolicy`].
     pub trust_policy: Option<TrustPolicy>,
 
+    /// `auditLevel` from `pnpm-workspace.yaml`.
+    pub audit_level: Option<AuditLevel>,
+
+    /// `auditConfig` from `pnpm-workspace.yaml`.
+    pub audit_config: Option<AuditConfig>,
+
     /// `trustPolicyExclude` from `pnpm-workspace.yaml`.
     pub trust_policy_exclude: Option<Vec<String>>,
 
@@ -521,6 +535,11 @@ pub enum LoadWorkspaceYamlError {
         path: PathBuf,
         #[error(source)]
         source: Box<serde_saphyr::Error>,
+    },
+    #[display("Invalid `_auth` setting: {source}")]
+    InvalidJsonAuth {
+        #[error(source)]
+        source: serde_json::Error,
     },
 }
 
@@ -866,6 +885,12 @@ impl WorkspaceSettings {
         }
         if let Some(v) = self.trust_policy {
             config.trust_policy = v;
+        }
+        if let Some(v) = self.audit_level {
+            config.audit_level = Some(v);
+        }
+        if let Some(v) = self.audit_config {
+            config.audit_config = v;
         }
         if let Some(v) = self.trust_policy_exclude {
             config.trust_policy_exclude = Some(v);

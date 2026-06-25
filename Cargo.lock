@@ -3608,6 +3608,7 @@ dependencies = [
  "pacquet-env-installer",
  "pacquet-executor",
  "pacquet-fs",
+ "pacquet-global",
  "pacquet-graph-hasher",
  "pacquet-hooks",
  "pacquet-lockfile",
@@ -3622,6 +3623,7 @@ dependencies = [
  "pacquet-reporter",
  "pacquet-resolving-npm-resolver",
  "pacquet-resolving-parse-wanted-dependency",
+ "pacquet-resolving-resolver-base",
  "pacquet-store-dir",
  "pacquet-tarball",
  "pacquet-testing-utils",
@@ -3629,10 +3631,12 @@ dependencies = [
  "pacquet-workspace-manifest-writer",
  "pacquet-workspace-projects-graph",
  "pacquet-workspace-state",
+ "pathdiff",
  "pipe-trait",
  "pnpr",
  "pretty_assertions",
  "rayon",
+ "reqwest 0.13.4",
  "rmp-serde",
  "serde",
  "serde-saphyr",
@@ -3690,6 +3694,8 @@ dependencies = [
  "smart-default",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -3949,6 +3955,21 @@ dependencies = [
  "tokio",
  "tracing",
  "walkdir",
+]
+
+[[package]]
+name = "pacquet-global"
+version = "0.0.1"
+dependencies = [
+ "derive_more",
+ "miette 7.6.0",
+ "owo-colors",
+ "pacquet-cmd-shim",
+ "pacquet-crypto-hash",
+ "pacquet-fs",
+ "pacquet-resolving-deps-resolver",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
