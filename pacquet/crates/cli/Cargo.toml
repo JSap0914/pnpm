@@ -19,6 +19,8 @@ pacquet-auth-commands                     = { workspace = true }
 pacquet-catalogs-config                   = { workspace = true }
 pacquet-cmd-shim                          = { workspace = true }
 pacquet-crypto-hash                       = { workspace = true }
+pacquet-detect-libc                       = { workspace = true }
+pacquet-engine-runtime-node-resolver      = { workspace = true }
 pacquet-pnpr-client                       = { workspace = true }
 pacquet-env-installer                     = { workspace = true }
 pacquet-executor                          = { workspace = true }
@@ -31,6 +33,8 @@ pacquet-modules-yaml                      = { workspace = true }
 pacquet-network                           = { workspace = true }
 pacquet-config                            = { workspace = true }
 pacquet-default-reporter                  = { workspace = true }
+pacquet-deps-path                         = { workspace = true }
+pacquet-pack                              = { workspace = true }
 pacquet-package-manifest                  = { workspace = true }
 pacquet-package-manager                   = { workspace = true }
 pacquet-patching                          = { workspace = true }
@@ -43,9 +47,11 @@ pacquet-resolving-resolver-base           = { workspace = true }
 pacquet-store-dir                         = { workspace = true }
 pacquet-tarball                           = { workspace = true }
 pacquet-diagnostics                       = { workspace = true }
+pacquet-directory-fetcher                 = { workspace = true }
 pacquet-workspace                         = { workspace = true }
 pacquet-workspace-manifest-writer         = { workspace = true }
 pacquet-workspace-projects-graph          = { workspace = true }
+pacquet-workspace-projects-filter         = { workspace = true }
 pacquet-workspace-state                   = { workspace = true }
 
 chrono               = { workspace = true }
@@ -59,6 +65,7 @@ indexmap             = { workspace = true }
 node-semver          = { workspace = true }
 miette               = { workspace = true }
 owo-colors.workspace = true
+p256                 = { workspace = true }
 pathdiff             = { workspace = true }
 pipe-trait           = { workspace = true }
 rayon                = { workspace = true }
@@ -69,6 +76,8 @@ serde_json           = { workspace = true }
 tabled               = { workspace = true }
 tempfile             = { workspace = true }
 tokio                = { workspace = true }
+tracing              = { workspace = true }
+url                  = { workspace = true }
 which                = { workspace = true }
 base64               = { workspace = true }
 wax                  = { workspace = true }

@@ -51,6 +51,9 @@ fn create_config(store_dir: &Path, modules_dir: &Path, virtual_store_dir: &Path)
         prefer_frozen_lockfile: false,
         optimistic_repeat_install: false,
         skip_runtimes: false,
+        deploy_all_files: false,
+        force_legacy_deploy: false,
+        shared_workspace_lockfile: true,
         offline: false,
         prefer_offline: false,
         lockfile_include_tarball_url: false,
@@ -133,11 +136,13 @@ fn create_config(store_dir: &Path, modules_dir: &Path, virtual_store_dir: &Path)
         peer_dependency_rules: Default::default(),
         auth_headers: Default::default(),
         auth_tokens_by_uri: Default::default(),
-        config_dir: None,
         proxy: Default::default(),
         tls: Default::default(),
         tls_by_uri: Default::default(),
         package_manager_bootstrap: Default::default(),
+        explicit_settings: Default::default(),
+        raw_auth_config: Default::default(),
+        config_dir: None,
     }
 }
 

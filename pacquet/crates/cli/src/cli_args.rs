@@ -4,8 +4,12 @@ pub mod audit;
 pub mod cache;
 pub mod cat_file;
 pub mod cat_index;
+pub mod completion;
+pub mod config;
 pub mod create;
 pub mod dedupe;
+pub mod deploy;
+pub mod dist_tag;
 pub mod dlx;
 pub mod exec;
 pub mod fetch;
@@ -18,15 +22,20 @@ pub mod link;
 pub mod list;
 pub mod logout;
 pub mod outdated;
+pub mod pack;
+pub mod pack_app;
 pub mod patch;
 pub mod patch_commit;
 pub mod patch_remove;
 pub(crate) mod patch_state;
+pub mod ping;
 pub mod prune;
 pub mod rebuild;
 pub mod recursive;
+pub mod registry_client;
 pub mod remove;
 pub mod restart;
+pub mod root;
 pub mod run;
 pub mod runtime;
 pub mod sanitize;
@@ -37,6 +46,7 @@ pub mod supported_architectures;
 pub mod unlink;
 pub mod update;
 pub mod update_interactive;
+pub mod whoami;
 pub mod why;
 
 use crate::{State, config_deps, config_overrides::ConfigOverrides};
@@ -47,8 +57,12 @@ use cache::CacheCommand;
 use cat_file::CatFileArgs;
 use cat_index::CatIndexArgs;
 use clap::{Parser, Subcommand, ValueEnum};
+use completion::{CompletionArgs, CompletionServerArgs};
+use config::ConfigArgs;
 use create::CreateArgs;
 use dedupe::DedupeArgs;
+use deploy::DeployArgs;
+use dist_tag::DistTagArgs;
 use dlx::DlxArgs;
 use exec::ExecArgs;
 use fetch::FetchArgs;
@@ -61,6 +75,8 @@ use list::ListArgs;
 use logout::LogoutArgs;
 use miette::{Context, IntoDiagnostic};
 use outdated::{OutdatedArgs, OutdatedOutcome};
+use pack::PackArgs;
+use pack_app::PackAppArgs;
 use pacquet_config::{Config, Host};
 use pacquet_default_reporter::DefaultReporter;
 use pacquet_executor::execute_shell;
@@ -71,10 +87,12 @@ use pacquet_reporter::{
 use patch::PatchArgs;
 use patch_commit::PatchCommitArgs;
 use patch_remove::PatchRemoveArgs;
+use ping::PingArgs;
 use prune::PruneArgs;
 use rebuild::RebuildArgs;
 use remove::RemoveArgs;
 use restart::RestartArgs;
+use root::RootArgs;
 use run::RunArgs;
 use runtime::RuntimeArgs;
 use serde_json::Value;
@@ -183,14 +201,26 @@ pub enum CliCommand {
     Outdated(OutdatedArgs),
     /// Checks for known security issues with the installed packages.
     Audit(AuditArgs),
-    /// List installed packages (global only for now).
+    /// List installed packages.
     #[clap(visible_alias = "ls")]
     List(ListArgs),
+    /// List installed packages in long format.
+    #[clap(visible_alias = "la")]
+    Ll(ListArgs),
     /// Shows the packages that depend on `pkg`
     Why(WhyArgs),
+    /// Displays your pnpm username.
+    Whoami,
+    /// Manage a package's distribution tags.
+    #[clap(name = "dist-tag", visible_alias = "dist-tags")]
+    DistTag(DistTagArgs),
+    /// Test connectivity to the configured registry.
+    Ping(PingArgs),
     /// Rebuild a package.
     #[clap(visible_alias = "rb")]
     Rebuild(RebuildArgs),
+    /// Create a tarball from a package
+    Pack(PackArgs),
     /// Removes packages from `node_modules` and from the project's `package.json`.
     // Unlike npm, pnpm does not treat "r" as an alias of "remove" to avoid
     // confusion with "run" and "recursive". Mirrors pnpm's `commandNames`.
@@ -217,6 +247,11 @@ pub enum CliCommand {
     Dlx(DlxArgs),
     /// Creates a project from a `create-*` starter kit.
     Create(CreateArgs),
+    /// Print shell completion code to stdout.
+    Completion(CompletionArgs),
+    /// Dynamic completion endpoint used by generated shell scripts.
+    #[clap(name = "completion-server", hide = true)]
+    CompletionServer(CompletionServerArgs),
     /// Runs an arbitrary command specified in the package's start property of its scripts object.
     Start,
     /// Runs a package's "stop" script, if one was provided.
@@ -229,6 +264,14 @@ pub enum CliCommand {
     /// Manage runtimes.
     #[clap(visible_alias = "rt")]
     Runtime(RuntimeArgs),
+    /// Print the effective `node_modules` directory.
+    Root(RootArgs),
+    /// Manage the pnpm configuration files.
+    #[clap(visible_alias = "c")]
+    Config(ConfigArgs),
+    /// Pack a `CommonJS` entry file into a standalone executable for one or more target platforms.
+    #[clap(name = "pack-app")]
+    PackApp(PackAppArgs),
     /// Managing the package store.
     #[clap(subcommand)]
     Store(StoreCommand),
@@ -250,6 +293,8 @@ pub enum CliCommand {
     Import(ImportArgs),
     /// Deduplicate packages in the lockfile
     Dedupe(DedupeArgs),
+    /// Deploy a package from a workspace
+    Deploy(DeployArgs),
     /// Remove extraneous packages
     Prune(PruneArgs),
     /// Fetch packages from the lockfile into the virtual store
@@ -262,6 +307,20 @@ pub enum CliCommand {
 }
 
 impl CliArgs {
+    pub fn run_completion_if_requested(&self) -> miette::Result<bool> {
+        match &self.command {
+            CliCommand::Completion(args) => {
+                args.run()?;
+                Ok(true)
+            }
+            CliCommand::CompletionServer(args) => {
+                args.run()?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Try to finish `pacquet install` synchronously through the
     /// repeat-install fast path, before the caller builds the async
     /// runtime. `true` means the install completed (the "Already up to
@@ -316,8 +375,13 @@ impl CliArgs {
         reason = "the run function dispatches all CLI commands and contains large types like Install on the stack"
     )]
     pub async fn run(self, config_overrides: &ConfigOverrides) -> miette::Result<()> {
+        if self.run_completion_if_requested()? {
+            return Ok(());
+        }
+
         let CliArgs { command, dir, npmrc_auth_file, recursive, reporter, filter, filter_prod } =
             self;
+
         // Canonicalize `--dir` so the bunyan-envelope `prefix` emitted by
         // the reporter is the same absolute, symlink-resolved path that
         // `@pnpm/cli.default-reporter` derives via `process.cwd()`. Without
@@ -346,6 +410,7 @@ impl CliArgs {
                 | CliCommand::Link(_)
                 | CliCommand::Import(_)
                 | CliCommand::Dedupe(_)
+                | CliCommand::Deploy(_)
                 | CliCommand::Prune(_)
                 | CliCommand::Fetch(_)
                 | CliCommand::Unlink(_)
@@ -500,12 +565,80 @@ impl CliArgs {
                 }
             }
             CliCommand::List(args) => {
-                args.run(config()?)?;
+                args.run(config()?, dir_ref)?;
+                Box::pin(std::future::ready(Ok(())))
+            }
+            CliCommand::Ll(mut args) => {
+                args.long = true;
+                args.run(config()?, dir_ref)?;
                 Box::pin(std::future::ready(Ok(())))
             }
             CliCommand::Why(args) => Box::pin(args.run(state(true)?)),
             CliCommand::Remove(args) if args.global => {
                 global::handle_global_remove(config()?, &args.package_names)?;
+                Box::pin(std::future::ready(Ok(())))
+            }
+            // `whoami` is a read-only registry query: it resolves the
+            // default registry's auth header from config and GETs
+            // `-/whoami`, with no lockfile or install pipeline. It needs
+            // an async future for the request but no reporter-typed
+            // fan-out, so it dispatches off `config()` like the other
+            // read-only commands.
+            CliCommand::Whoami => {
+                let cfg: &Config = config()?;
+                Box::pin(async move {
+                    let username = whoami::whoami(cfg).await?;
+                    println!("{}", sanitize::sanitize(&username));
+                    Ok(())
+                })
+            }
+            CliCommand::DistTag(args) => {
+                let cfg: &Config = config()?;
+                Box::pin(async move {
+                    if let Some(output) = args.run(cfg).await? {
+                        let output = sanitize::sanitize(&output);
+                        if output.is_empty() {
+                            return Ok(());
+                        }
+                        println!("{output}");
+                    }
+                    Ok(())
+                })
+            }
+            // `ping` is a read-only connectivity check: it resolves the
+            // registry (and any auth header) from config and GETs
+            // `-/ping`, with no lockfile or install pipeline, so it
+            // dispatches off `config()` like the other read-only registry
+            // commands.
+            CliCommand::Ping(args) => {
+                let cfg: &Config = config()?;
+                Box::pin(async move {
+                    let report = args.run(cfg).await?;
+                    println!("{report}");
+                    Ok(())
+                })
+            }
+            // `pack` prints the tarball summary (or JSON) its handler
+            // returns; the reporter type only affects the lifecycle-script
+            // output, so it's threaded into `run` and the result printed
+            // here, mirroring pnpm's `handler` → CLI print split. The
+            // handler is synchronous, so this arm resolves to a ready
+            // future once the output is printed.
+            CliCommand::Pack(args) => {
+                let output = match reporter {
+                    ReporterType::Default | ReporterType::AppendOnly => {
+                        args.run::<DefaultReporter>(dir_ref, config()?, recursive)?
+                    }
+                    ReporterType::Ndjson => {
+                        args.run::<NdjsonReporter>(dir_ref, config()?, recursive)?
+                    }
+                    ReporterType::Silent => {
+                        args.run::<SilentReporter>(dir_ref, config()?, recursive)?
+                    }
+                };
+                if !output.is_empty() {
+                    println!("{output}");
+                }
                 Box::pin(std::future::ready(Ok(())))
             }
             CliCommand::Remove(args) => {
@@ -623,30 +756,7 @@ impl CliArgs {
                     // mutable through `Config::leak`'s
                     // `&'static mut Config` return.
                     let cfg = config()?;
-                    cfg.offline = cfg.offline || args.offline;
-                    cfg.prefer_offline = cfg.prefer_offline || args.prefer_offline;
-                    cfg.frozen_store = cfg.frozen_store || args.frozen_store;
-                    // `--ignore-scripts` enables (never toggles off) the
-                    // config value, matching the "enable" CLI flags above.
-                    cfg.ignore_scripts = cfg.ignore_scripts || args.ignore_scripts;
-                    cfg.workspace_concurrency =
-                        args.resolve_workspace_concurrency(cfg.workspace_concurrency);
-                    // Network overrides: a passed `--network-concurrency` /
-                    // `--fetch-timeout` / `--user-agent` replaces the
-                    // config-resolved value for this invocation, matching
-                    // pnpm's "CLI wins" precedence.
-                    if let Some(network_concurrency) = args.network_concurrency {
-                        cfg.network_concurrency = network_concurrency;
-                    }
-                    if let Some(fetch_timeout) = args.fetch_timeout {
-                        cfg.fetch_timeout = fetch_timeout;
-                    }
-                    if let Some(user_agent) = args.user_agent.clone() {
-                        cfg.user_agent = user_agent;
-                    }
-                    if let Some(pnpr_server) = args.pnpr_server.clone() {
-                        cfg.pnpr_server = Some(pnpr_server);
-                    }
+                    apply_install_cli_config(cfg, &args);
                     let require_lockfile = args.frozen_lockfile;
                     let frozen_lockfile = args.frozen_lockfile;
                     // Config dependencies are workspace-level state: their
@@ -685,6 +795,33 @@ impl CliArgs {
                         }
                         ReporterType::Silent => {
                             Box::pin(pipeline.run::<SilentReporter>()).await?;
+                        }
+                    }
+                }
+                Ok(())
+            }),
+            CliCommand::Deploy(args) => Box::pin(async move {
+                #[allow(
+                    clippy::large_stack_frames,
+                    reason = "the three monomorphized deploy futures would otherwise each reserve their full size in this frame"
+                )]
+                {
+                    let cfg = config()?;
+                    apply_install_cli_config(cfg, &args.install_args);
+                    let (config_root, package_manager_to_sync) =
+                        derive_config_root_and_package_manager_to_sync(cfg, dir_ref)
+                            .wrap_err("derive workspace root and package manager policy")?;
+                    let pipeline =
+                        DeployPipeline { args, cfg, config_root, package_manager_to_sync };
+                    match reporter {
+                        ReporterType::Default | ReporterType::AppendOnly => {
+                            Box::pin(pipeline.run::<DefaultReporter>(dir_ref)).await?;
+                        }
+                        ReporterType::Ndjson => {
+                            Box::pin(pipeline.run::<NdjsonReporter>(dir_ref)).await?;
+                        }
+                        ReporterType::Silent => {
+                            Box::pin(pipeline.run::<SilentReporter>(dir_ref)).await?;
                         }
                     }
                 }
@@ -757,6 +894,24 @@ impl CliArgs {
                     ReporterType::Ndjson => Box::pin(args.run::<NdjsonReporter>(command_state)),
                     ReporterType::Silent => Box::pin(args.run::<SilentReporter>(command_state)),
                 }
+            }
+            CliCommand::Root(args) => {
+                args.run(dir_ref)?;
+                Box::pin(std::future::ready(Ok(())))
+            }
+            CliCommand::Config(args) => {
+                args.run(config()?, dir_ref)?;
+                Box::pin(std::future::ready(Ok(())))
+            }
+            // `pack-app` reads `pnpm.app` from package.json, resolves a
+            // Node.js version over the network, and shells out to build the
+            // SEA executables. It needs config (proxy / TLS / registry) and
+            // the canonicalized `--dir` but no lockfile or install
+            // pipeline, so it dispatches off `config()` like the other
+            // read-only commands.
+            CliCommand::PackApp(args) => {
+                let cfg: &Config = config()?;
+                Box::pin(async move { args.run(cfg, dir_ref).await })
             }
             CliCommand::Store(command) => {
                 command.run(|| config().map(|m| &*m))?;
@@ -920,6 +1075,9 @@ impl CliArgs {
                     }),
                 }
             }
+            CliCommand::Completion(_) | CliCommand::CompletionServer(_) => {
+                unreachable!("completion returns before configuration")
+            }
         };
 
         command_future.await?;
@@ -983,6 +1141,33 @@ impl InstallPipeline {
     }
 }
 
+struct DeployPipeline {
+    args: DeployArgs,
+    cfg: &'static mut Config,
+    config_root: PathBuf,
+    package_manager_to_sync: Option<PackageManagerToSync>,
+}
+
+impl DeployPipeline {
+    async fn run<Reporter: self::Reporter + 'static>(self, dir_ref: &Path) -> miette::Result<()> {
+        let DeployPipeline { args, cfg, config_root, package_manager_to_sync } = self;
+        if let Some(pm) = package_manager_to_sync.as_ref() {
+            config_deps::sync_package_manager_dependencies(
+                cfg,
+                &config_root,
+                &pm.specifier,
+                &pm.version,
+                false,
+            )
+            .await?;
+        }
+        config_deps::install_config_deps::<Reporter>(cfg, &config_root, false).await?;
+        config_deps::run_update_config_hooks::<Reporter>(cfg, &config_root).await?;
+        let cfg: &'static Config = cfg;
+        Box::pin(args.run::<Reporter>(cfg, dir_ref)).await
+    }
+}
+
 /// Shared workspace-root and package-manager policy derivation used by the
 /// install, dedupe, and prune dispatch paths.
 fn derive_config_root_and_package_manager_to_sync(
@@ -994,6 +1179,26 @@ fn derive_config_root_and_package_manager_to_sync(
         package_manager_to_sync(&config_root.join("package.json"), &config_root)
             .wrap_err("read package manager policy")?;
     Ok((config_root, package_manager_to_sync))
+}
+
+fn apply_install_cli_config(cfg: &mut Config, args: &InstallArgs) {
+    cfg.offline = cfg.offline || args.offline;
+    cfg.prefer_offline = cfg.prefer_offline || args.prefer_offline;
+    cfg.frozen_store = cfg.frozen_store || args.frozen_store;
+    cfg.ignore_scripts = cfg.ignore_scripts || args.ignore_scripts;
+    cfg.workspace_concurrency = args.resolve_workspace_concurrency(cfg.workspace_concurrency);
+    if let Some(network_concurrency) = args.network_concurrency {
+        cfg.network_concurrency = network_concurrency;
+    }
+    if let Some(fetch_timeout) = args.fetch_timeout {
+        cfg.fetch_timeout = fetch_timeout;
+    }
+    if let Some(user_agent) = args.user_agent.clone() {
+        cfg.user_agent = user_agent;
+    }
+    if let Some(pnpr_server) = args.pnpr_server.clone() {
+        cfg.pnpr_server = Some(pnpr_server);
+    }
 }
 
 /// The reporter-generic body of `pacquet dedupe`: snapshots the lockfile

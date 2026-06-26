@@ -1,9 +1,13 @@
 mod api;
+pub mod config_types;
 mod defaults;
 mod env_overlay;
 mod global_bin_check;
 pub mod matcher;
+pub mod naming_cases;
 mod npmrc_auth;
+pub mod property_path;
+pub mod protected_settings;
 mod store_path;
 pub mod version_policy;
 mod workspace_yaml;
@@ -650,6 +654,19 @@ pub struct Config {
     /// pre-provision the runtime (or want to install one runtime
     /// with another pacquet binary) flip this to `true`.
     pub skip_runtimes: bool,
+
+    /// Copy every project file during `pnpm deploy` instead of the publish
+    /// packlist. Default `false`, matching pnpm's `deployAllFiles`.
+    pub deploy_all_files: bool,
+
+    /// Force `pnpm deploy` to use the legacy install-based implementation
+    /// even when a shared workspace lockfile is available.
+    pub force_legacy_deploy: bool,
+
+    /// Whether the workspace uses a single root `pnpm-lock.yaml`. Default
+    /// `true`, matching pnpm's `sharedWorkspaceLockfile`.
+    #[default = true]
+    pub shared_workspace_lockfile: bool,
 
     /// Refuse network requests during install. Mirrors pnpm's
     /// [`offline`](https://github.com/pnpm/pnpm/blob/94240bc046/resolving/npm-resolver/src/pickPackage.ts)
@@ -1526,13 +1543,33 @@ pub struct Config {
     /// that the auth commands consult.
     pub auth_tokens_by_uri: std::collections::HashMap<String, String>,
 
-    /// The directory pnpm reads its global `config.yaml` from and where
-    /// `pnpm login` writes `auth.ini` — pnpm's `configDir`. `None` when
-    /// no home directory could be resolved. Resolved by
-    /// `default_config_dir`.
-    pub config_dir: Option<PathBuf>,
-
     pub package_manager_bootstrap: PackageManagerBootstrap,
+
+    /// Camel-cased record of the settings the user *explicitly* set through
+    /// `pnpm-workspace.yaml`, the global `config.yaml`, and `PNPM_CONFIG_*`
+    /// env vars (with `_auth` excluded and `null` values dropped). Populated
+    /// by [`Config::current`]; empty when a `Config` is built without it.
+    ///
+    /// This is pacquet's stand-in for pnpm's `explicitlySetKeys` + the merged
+    /// config record consumed by `pnpm config get` / `pnpm config list`:
+    /// because [`WorkspaceSettings`]'s fields are `Option`s, a serialized
+    /// settings struct names exactly the keys a source set, with the user's
+    /// raw value. The `config` command turns this into the record it prints.
+    pub explicit_settings: serde_json::Map<String, serde_json::Value>,
+
+    /// Raw `.npmrc` / `auth.ini` config keys (those for which
+    /// [`config_types::is_ini_config_key`] holds: `registry`, `@scope:registry`,
+    /// `//host/:_authToken`, `username`, `ca`, ...), post-`${VAR}` substitution
+    /// and merged across sources. pacquet's stand-in for pnpm's `authConfig`
+    /// map, consumed by `pnpm config get` / `pnpm config list`.
+    pub raw_auth_config: BTreeMap<String, String>,
+
+    /// The global pnpm config directory (`<configDir>`), where `config.yaml`
+    /// and `auth.ini` live (`pnpm login` writes the token there; `pnpm logout`
+    /// reads it back to revoke it). `None` when it cannot be determined.
+    /// Resolved by `default_config_dir`. Mirrors pnpm's `Config.configDir`;
+    /// consumed by `pnpm config` and by `globalconfig` lookups.
+    pub config_dir: Option<PathBuf>,
 }
 
 /// Registry + network configuration for resolving the package manager pnpm
@@ -1988,6 +2025,10 @@ impl Config {
         for lower in sources {
             npmrc_auth.merge_under(lower);
         }
+        // Retain the merged raw `.npmrc` / `auth.ini` config keys for
+        // `pnpm config get` / `pnpm config list` before the structured fields
+        // are consumed below.
+        self.raw_auth_config = std::mem::take(&mut npmrc_auth.raw_ini_config);
 
         let mut trusted_sources = trusted_sources.into_iter().flatten();
         let mut trusted_auth = trusted_sources.next().unwrap_or_default();
@@ -2046,6 +2087,7 @@ impl Config {
             virtual_store_dir_explicit |= global_settings.virtual_store_dir.is_some();
             global_virtual_store_dir_explicit |= global_settings.global_virtual_store_dir.is_some();
             store_dir_explicit |= global_settings.store_dir.is_some();
+            collect_explicit_settings(&mut self.explicit_settings, &global_settings);
             let saved_workspace_dir = self.workspace_dir.take();
             global_settings.apply_to(&mut self, start_dir);
             self.workspace_dir = saved_workspace_dir;
@@ -2101,6 +2143,7 @@ impl Config {
                 global_virtual_store_dir_explicit |= settings.global_virtual_store_dir.is_some();
                 store_dir_explicit |= settings.store_dir.is_some();
                 settings.substitute_env_untrusted::<Sys>();
+                collect_explicit_settings(&mut self.explicit_settings, &settings);
                 settings.apply_to(&mut self, &base_dir);
             }
         }
@@ -2134,6 +2177,7 @@ impl Config {
         // `PNPM_CONFIG_REGISTRY` comes from the environment, not the
         // repository, so it overrides the bootstrap default registry too.
         let env_registry_override = env_settings.registry.clone();
+        collect_explicit_settings(&mut self.explicit_settings, &env_settings);
         let saved_workspace_dir = self.workspace_dir.clone();
         env_settings.apply_to(&mut self, start_dir);
         self.workspace_dir = saved_workspace_dir;
@@ -2222,6 +2266,29 @@ impl Config {
     /// Persist the config data until the program terminates.
     pub fn leak(self) -> &'static mut Self {
         self.pipe(Box::new).pipe(Box::leak)
+    }
+}
+
+/// Fold a source's explicitly-set settings into the running record.
+///
+/// Serializes `settings` to a camelCase JSON object (its `Option` fields make
+/// a serialized value name exactly the keys this source set) and copies every
+/// non-`null` entry into `target`, later sources overriding earlier ones. The
+/// `_auth` key is dropped — it carries credentials and never belongs in
+/// `pnpm config list` output (raw auth keys come from `raw_auth_config`,
+/// censored at render time).
+fn collect_explicit_settings(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    settings: &WorkspaceSettings,
+) {
+    let Ok(serde_json::Value::Object(map)) = serde_json::to_value(settings) else {
+        return;
+    };
+    for (key, value) in map {
+        if key == "_auth" || value.is_null() {
+            continue;
+        }
+        target.insert(key, value);
     }
 }
 
